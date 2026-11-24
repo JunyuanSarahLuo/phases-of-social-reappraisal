@@ -1,0 +1,812 @@
+---
+title: "PORS_clean"
+author: "Junyuan (Sarah) Luo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)        # data wrangling
+library(tidyr)        # pivot_longer()
+library(readxl)       # read_excel()
+library(lme4)         # lmer()
+library(lmerTest)     # Satterthwaite df and p values for lmer models
+library(emmeans)      # estimated marginal means and contrasts
+library(parameters)   # model_parameters()
+library(performance)  # icc(), r2_nakagawa(), check_model()
+library(psych)        # describe(), alpha(), corr.test()
+library(ggplot2)      # figures
+library(patchwork)    # combining figures
+```
+
+# DATA PREPARATION
+
+## Read in data
+```{r}
+PORS <- read_excel("PORS_task.xlsx", sheet = "Clean")
+Demo <- read_excel("PORS_survey.xlsx", sheet = "Sheet1") %>% rename(Subject = ID)
+
+# Interaction frequency (hours per week together, reported by experiencers at pre-screening)
+# Experiencer IDs start at 1001; helper IDs are in the 100s
+Freq <- read_excel("PORS_hours.xlsx", sheet = "Hours") %>%
+  filter(ID >= 1000) %>%
+  transmute(Subject = as.character(ID), Hours = as.numeric(Hours))
+```
+
+## Participant exclusions
+```{r}
+# Number of participants before exclusion
+n_distinct(PORS$Subject)
+
+# No variance in responses: same score in 10 or more consecutive ratings
+items <- c("PE1", "PE2", "Diff1", "Diff2", "Plau", "Success")
+
+Response_variance <- PORS %>%
+  group_by(Subject) %>%
+  mutate(row_id = row_number()) %>%
+  ungroup() %>%
+  pivot_longer(cols = all_of(items), names_to = "item", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(item = factor(item, levels = items)) %>%  # keep item order within each trial
+  arrange(Subject, row_id, item) %>%
+  group_by(Subject) %>%
+  summarise(max_run_same_value = max(rle(value)$lengths), .groups = "drop")
+
+Response_variance %>% filter(max_run_same_value >= 10) %>% pull(Subject)
+# 1009, 1034, 1042, 1100, 1127
+
+# No variance in PE: same score on more than 90% of reappraisal trials in either phase
+PE_noVariance <- PORS %>%
+  filter(!Trial %in% c("Look Negative", "Look Neutral")) %>%
+  pivot_longer(cols = c(PE1, PE2), names_to = "Phase", values_to = "PE") %>%
+  count(Subject, Phase, PE, name = "n_PE") %>%
+  group_by(Subject, Phase) %>%
+  summarise(prop_mode = max(n_PE) / sum(n_PE), .groups = "drop") %>%
+  filter(prop_mode >= 0.90)
+PE_noVariance
+# 1048
+
+exclude_ids <- c(1009, 1034, 1042, 1100, 1127, 1048)
+PORS <- PORS %>% filter(!Subject %in% exclude_ids)
+Demo <- Demo %>% filter(!Subject %in% exclude_ids)
+
+n_distinct(PORS$Subject) # 78
+```
+
+## Person-level variables
+```{r}
+# The first 21 dyads chose their roles; later dyads were randomly assigned
+self_ids <- as.character(setdiff(1001:1034,
+                                 c(1004, 1008, 1013, 1014, 1018, 1020, 1023,
+                                   1024, 1028, 1029, 1030, 1032, 1033)))
+
+relationship_items <- c("Support", "Significance", "Close", "Trust", "Know")
+
+Demo <- Demo %>%
+  mutate(Subject = as.character(Subject)) %>%
+  left_join(Freq, by = "Subject") %>%
+  mutate(
+    relationship = rowMeans(across(all_of(relationship_items)), na.rm = TRUE),
+    Assign = factor(ifelse(Subject %in% self_ids, "Self-selected", "Random"),
+                    levels = c("Random", "Self-selected"))
+  ) %>%
+  # Grand-mean centering for moderation models
+  mutate(across(c(relationship, Length), ~ .x - mean(.x, na.rm = TRUE), .names = "{.col}_mc"))
+
+# Every experiencer should have an hours value (should be 0)
+sum(is.na(Demo$Hours))
+
+PORS <- PORS %>%
+  mutate(Subject = as.character(Subject), Image = factor(Image)) %>%
+  left_join(Demo, by = "Subject")
+```
+
+## Dataframes without a Phase variable
+```{r}
+# Neg_collapsed         = negative-image trials (Look Negative, Solo, Social)
+# Reapp_collapsed       = reappraisal trials (Solo, Social)
+# Reapp_collapsed_clean = reappraisal trials, excluding trials with any 0 ("did not do it") response
+Neg_collapsed <- PORS %>%
+  filter(Trial != "Look Neutral") %>%
+  mutate(Trial = factor(Trial, levels = c("Look Negative", "Solo", "Social")))
+
+Reapp_collapsed <- Neg_collapsed %>%
+  filter(Trial != "Look Negative") %>%
+  mutate(Trial = factor(Trial, levels = c("Solo", "Social")))
+
+Reapp_collapsed_clean <- Reapp_collapsed %>%
+  filter(
+    is.na(Diff1)   | Diff1   != 0,
+    is.na(Diff2)   | Diff2   != 0,
+    is.na(Plau)    | Plau    != 0,
+    is.na(Success) | Success != 0
+  )
+
+# Person-mean (pm), within-person (wp), and between-person (bp) versions for exploratory models
+Reapp_collapsed_clean <- Reapp_collapsed_clean %>%
+  group_by(Subject) %>%
+  mutate(across(c(Diff1, Diff2, Plau, PE1, PE2), ~ mean(.x, na.rm = TRUE), .names = "{.col}_pm")) %>%
+  ungroup() %>%
+  mutate(
+    Diff1_wp = Diff1 - Diff1_pm,
+    Diff2_wp = Diff2 - Diff2_pm,
+    Plau_wp  = Plau  - Plau_pm,
+    PE1_wp   = PE1   - PE1_pm,
+    PE2_wp   = PE2   - PE2_pm,
+    Diff1_bp = Diff1_pm - mean(Diff1_pm, na.rm = TRUE),
+    Diff2_bp = Diff2_pm - mean(Diff2_pm, na.rm = TRUE),
+    Plau_bp  = Plau_pm  - mean(Plau_pm,  na.rm = TRUE),
+    PE1_bp   = PE1_pm   - mean(PE1_pm,   na.rm = TRUE),
+    PE2_bp   = PE2_pm   - mean(PE2_pm,   na.rm = TRUE)
+  )
+
+# Number of implementation tactics used on each trial
+tactics <- paste0("Tactic", 1:5)
+Reapp_collapsed_clean <- Reapp_collapsed_clean %>%
+  mutate(n_tactics = rowSums(across(all_of(tactics)) == 1, na.rm = TRUE))
+```
+
+## Dataframes with a Phase variable
+```{r}
+# Reapp_phase       = reappraisal trials in long format (one row per phase)
+# Reapp_phase_clean = same, excluding trials with any 0 ("did not do it") response
+PORS_phase <- PORS %>%
+  pivot_longer(cols = c(PE1, PE2, Diff1, Diff2),
+               names_to = c(".value", "Phase"),
+               names_pattern = "(PE|Diff)([12])") %>%
+  mutate(Phase = factor(Phase, levels = c(1, 2), labels = c("Generate/Listen", "Implement")))
+
+Reapp_phase <- PORS_phase %>%
+  filter(Trial %in% c("Solo", "Social")) %>%
+  mutate(Trial = factor(Trial, levels = c("Solo", "Social")))
+
+# Rows are excluded if that phase's difficulty, or plausibility or success, is 0
+Reapp_phase_clean <- Reapp_phase %>%
+  filter(
+    is.na(Diff)    | Diff    != 0,
+    is.na(Plau)    | Plau    != 0,
+    is.na(Success) | Success != 0
+  )
+```
+
+## Dataframes for gender analyses
+```{r}
+# Dyads in which both members identified as a man or a woman
+gender_labels <- function(d) {
+  d %>%
+    filter(Gender %in% c(1, 2), h_Gender %in% c(1, 2)) %>%
+    mutate(Gender   = factor(Gender,   levels = c(2, 1), labels = c("Man", "Woman")),
+           h_Gender = factor(h_Gender, levels = c(2, 1), labels = c("Man", "Woman")))
+}
+Reapp_phase_clean_g     <- gender_labels(Reapp_phase_clean)
+Reapp_collapsed_clean_g <- gender_labels(Reapp_collapsed_clean)
+```
+
+## Dataframe for mediation
+```{r}
+# Complete cases on reappraisal origin, Phase 1 difficulty, plausibility, and Phase 1 PE,
+# with mediators re-centered within this subset
+med_dat <- Reapp_collapsed_clean %>%
+  filter(!is.na(PE1), !is.na(Diff1), !is.na(Plau), !is.na(Trial)) %>%
+  group_by(Subject) %>%
+  mutate(Diff1_pm = mean(Diff1), Plau_pm = mean(Plau),
+         Diff1_wp = Diff1 - Diff1_pm, Plau_wp = Plau - Plau_pm) %>%
+  ungroup() %>%
+  mutate(Diff1_bp = Diff1_pm - mean(Diff1_pm),
+         Plau_bp  = Plau_pm  - mean(Plau_pm))
+```
+
+# MANUSCRIPT
+
+# Method
+
+## Participants
+```{r}
+# Experiencer age, gender, race/ethnicity
+describe(Demo$Age)
+
+# Gender: 1 = Woman, 2 = Man, 3 = Non-binary/non-conforming
+table(Demo$Gender, useNA = "ifany")
+
+# Race/ethnicity (multiple selection allowed): 1 = African American/Black;
+# 2 = American Indian/Alaska Native; 3 = Asian/Asian American/Pacific Islander;
+# 4 = Caucasian/European American; 5 = Middle Eastern/Arab American; 6 = Latino/Hispanic;
+# 7 = Other; 8 = Prefer not to answer
+sapply(paste0("Race_", 1:8), function(v) {
+  n <- sum(Demo[[v]] == 1, na.rm = TRUE)
+  sprintf("%d (%.1f)", n, 100 * n / nrow(Demo))
+})
+
+# Dyad composition (experiencer gender x helper gender)
+Demo %>% count(Gender, h_Gender)
+```
+
+## Relationship measures
+```{r}
+# Relationship length (months)
+describe(Demo$Length)
+
+# Relationship quality: reliability and descriptives
+psych::alpha(Demo[relationship_items], warnings = FALSE)$total$raw_alpha
+describe(Demo$relationship)
+```
+
+## Trial exclusions
+```{r}
+# Trials with at least one 0 ("did not do it") response, by trial type
+Reapp_collapsed %>%
+  mutate(excluded = Diff1 == 0 | Diff2 == 0 | Plau == 0 | Success == 0) %>%
+  group_by(Trial) %>%
+  summarise(n_original  = n(),
+            n_excluded  = sum(excluded, na.rm = TRUE),
+            pct_excluded = 100 * n_excluded / n_original,
+            .groups = "drop")
+
+# Trials with no generation/receipt but implementation reported
+no_gen <- Reapp_collapsed %>%
+  mutate(no_gen_imp = (Diff1 == 0 | Plau == 0) & Success > 0)
+
+no_gen %>%
+  group_by(Trial) %>%
+  summarise(n = sum(no_gen_imp, na.rm = TRUE), .groups = "drop")
+sum(no_gen$no_gen_imp, na.rm = TRUE)
+100 * mean(no_gen$no_gen_imp, na.rm = TRUE)
+
+# Participants with at least one such trial
+no_gen %>%
+  group_by(Subject) %>%
+  summarise(any = any(no_gen_imp, na.rm = TRUE)) %>%
+  summarise(n = sum(any), pct = 100 * mean(any))
+```
+
+## Role assignment (footnote)
+```{r}
+# Does role assignment (self-selected vs. random) moderate the main effects?
+# Likelihood-ratio test of all assignment terms against each main model
+specs <- list(
+  PE2          = list(fixed = "PE2 ~ Trial",          re = "(1 + Trial | Subject)",         data = Neg_collapsed),
+  PE           = list(fixed = "PE ~ Phase * Trial",   re = "(1 + Phase + Trial | Subject)", data = Reapp_phase_clean),
+  Success      = list(fixed = "Success ~ Trial",      re = "(1 + Trial | Subject)",         data = Reapp_collapsed_clean),
+  Difficulty   = list(fixed = "Diff ~ Phase * Trial", re = "(1 + Phase + Trial | Subject)", data = Reapp_phase_clean),
+  Plausibility = list(fixed = "Plau ~ Trial",         re = "(1 + Trial | Subject)",         data = Reapp_collapsed_clean)
+)
+
+fit_spec <- function(fixed, re, data) {
+  lmer(as.formula(paste(fixed, "+", re)), data = data, REML = FALSE, na.action = na.exclude)
+}
+
+assign_tests <- bind_rows(lapply(names(specs), function(nm) {
+  s    <- specs[[nm]]
+  base <- fit_spec(s$fixed, s$re, s$data)
+  mod  <- fit_spec(sub("~\\s*(.*)$", "~ (\\1) * Assign", s$fixed), s$re, s$data)
+  lrt  <- anova(base, mod)
+  tibble(Outcome = nm, Chisq = lrt$Chisq[2], df = lrt$Df[2],
+         p = lrt$`Pr(>Chisq)`[2], singular = isSingular(mod))
+}))
+knitr::kable(assign_tests, digits = c(0, 2, 0, 3, 0))
+
+# Group sizes
+Demo %>% count(Assign)
+```
+
+# Results
+
+## ICCs for difficulty and plausibility
+```{r}
+icc(lmer(Diff1 ~ 1 + (1 | Subject), data = Reapp_collapsed_clean))
+icc(lmer(Diff2 ~ 1 + (1 | Subject), data = Reapp_collapsed_clean))
+icc(lmer(Plau  ~ 1 + (1 | Subject), data = Reapp_collapsed_clean))
+```
+
+## Solo and social reappraisal vs. Look Negative (Table 2, top)
+```{r}
+# All trials included
+m1 <- lmer(PE2 ~ Trial + (1 + Trial | Subject),
+           data = Neg_collapsed, REML = FALSE, na.action = na.exclude)
+
+emm1 <- emmeans(m1, ~ Trial)
+emm1
+con1 <- contrast(emm1, "trt.vs.ctrl", adjust = "none")
+summary(con1, infer = TRUE)
+```
+
+## Positive emotion by phase and reappraisal origin, excluding trials (Tables 1 and 2)
+```{r}
+# Used for: PE increase from generation/receipt to implementation, social vs. solo after
+# implementation (excluded), receipt ease (Phase 1), and implementation gain
+m2 <- lmer(PE ~ Phase * Trial + (1 + Phase + Trial | Subject),
+           data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+
+emm2 <- emmeans(m2, ~ Phase * Trial)
+emm2
+summary(pairs(emm2, reverse = TRUE), infer = TRUE)   # Tukey-adjusted
+
+# Implementation gain: (Phase 2 - Phase 1) in Social vs. Solo
+contrast(emm2, interaction = c("revpairwise", "pairwise")) %>% summary(infer = TRUE)
+```
+
+## Positive emotion by phase and reappraisal origin, all trials (Tables 1 and 2)
+```{r}
+# Used for: receipt success (Phase 1) and social vs. solo after implementation (all trials)
+m3 <- lmer(PE ~ Phase * Trial + (1 + Phase + Trial | Subject),
+           data = Reapp_phase, REML = FALSE, na.action = na.exclude)
+
+emm3 <- emmeans(m3, ~ Phase * Trial)
+emm3
+summary(pairs(emm3, reverse = TRUE), infer = TRUE)   # Tukey-adjusted
+```
+
+## Difficulty (Tables 1 and 2)
+```{r}
+# Phase 1 = receipt ease (generation vs. receipt); Phase 2 = implementation difficulty
+m5 <- lmer(Diff ~ Phase * Trial + (1 + Phase + Trial | Subject),
+           data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+
+emm5 <- emmeans(m5, ~ Phase * Trial)
+emm5
+summary(pairs(emm5, reverse = TRUE), infer = TRUE)   # Tukey-adjusted
+```
+
+## Plausibility (Table 1)
+```{r}
+m6 <- lmer(Plau ~ Trial + (1 + Trial | Subject),
+           data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+
+emm6 <- emmeans(m6, ~ Trial)
+emm6
+summary(pairs(emm6, reverse = TRUE), infer = TRUE)
+```
+
+## Implementation success (Table 2)
+```{r}
+m4 <- lmer(Success ~ Trial + (1 + Trial | Subject),
+           data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+
+emm4 <- emmeans(m4, ~ Trial)
+emm4
+summary(pairs(emm4, reverse = TRUE), infer = TRUE)
+```
+
+## Figure 2: Positive emotion, difficulty, and plausibility
+```{r, fig.width = 12, fig.height = 4.5}
+bar_phase <- function(emm, ylab) {
+  ggplot(as.data.frame(emm), aes(x = Trial, y = emmean, fill = Phase)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+    geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE),
+                  position = position_dodge(width = 0.7), width = 0.15) +
+    labs(x = "Trial Type", y = ylab, fill = "Phase") +
+    scale_y_continuous(breaks = 1:7) +
+    coord_cartesian(ylim = c(1, 7)) +
+    theme_classic(base_size = 14)
+}
+
+p_pe   <- bar_phase(emm2, "Positive Emotion")
+p_diff <- bar_phase(emm5, "Difficulty")
+p_plau <- ggplot(as.data.frame(emm6), aes(x = Trial, y = emmean)) +
+  geom_col(width = 0.6, fill = "#F8766D") +
+  geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.15) +
+  labs(x = "Trial Type", y = "Plausibility") +
+  scale_y_continuous(breaks = 1:7) +
+  coord_cartesian(ylim = c(1, 7)) +
+  theme_classic(base_size = 14)
+
+p_pe + p_diff + p_plau +
+  plot_layout(ncol = 3, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+## Mediation: difficulty and plausibility (Figure 3; Supplement Table S7)
+```{r}
+# X = reappraisal origin (Solo = 0, Social = 1)
+# M = Phase 1 difficulty and plausibility (parallel, within-person)
+# Y = Phase 1 positive emotion
+# Person-mean difficulty and plausibility are covariates in the b-path model
+
+# Fit the path models for a given random-effects structure
+fit_paths <- function(re, data = med_dat) {
+  f <- function(model) as.formula(paste(model, "+", re))
+  list(
+    c  = lmer(f("PE1 ~ Trial"),   data = data, REML = FALSE),   # total effect
+    a1 = lmer(f("Diff1 ~ Trial"), data = data, REML = FALSE),   # origin -> difficulty
+    a2 = lmer(f("Plau ~ Trial"),  data = data, REML = FALSE),   # origin -> plausibility
+    b  = lmer(f("PE1 ~ Trial + Diff1_wp + Plau_wp + Diff1_bp + Plau_bp"),
+              data = data, REML = FALSE)                        # b paths and direct effect (c')
+  )
+}
+
+# Monte Carlo confidence intervals for the indirect effects (Preacher & Selig, 2012)
+mc_mediation <- function(m, n = 20000, seed = 2026) {
+  set.seed(seed)
+  x  <- "TrialSocial"
+  bv <- c("Diff1_wp", "Plau_wp")
+  a1 <- rnorm(n, fixef(m$a1)[x], sqrt(vcov(m$a1)[x, x]))
+  a2 <- rnorm(n, fixef(m$a2)[x], sqrt(vcov(m$a2)[x, x]))
+  b  <- MASS::mvrnorm(n, fixef(m$b)[bv], as.matrix(vcov(m$b)[bv, bv]))
+
+  ind <- cbind(difficulty = a1 * b[, 1], plausibility = a2 * b[, 2])
+  ind <- cbind(ind, total = ind[, 1] + ind[, 2])
+
+  est <- c(fixef(m$a1)[x] * fixef(m$b)[bv[1]], fixef(m$a2)[x] * fixef(m$b)[bv[2]])
+  est <- c(est, sum(est))
+
+  list(
+    indirect = round(cbind(estimate = unname(est),
+                           t(apply(ind, 2, quantile, c(.025, .975)))), 3),
+    prop_mediated = round(unname(est[3] / fixef(m$c)[x]), 3)  # total indirect / total effect
+  )
+}
+
+med_main <- fit_paths("(1 + Trial | Subject)")
+sapply(med_main, isSingular)
+
+# Paths: a1, a2 = TrialSocial; b1, b2 = Diff1_wp, Plau_wp; c = TrialSocial in c;
+# c' = TrialSocial in b
+lapply(med_main, function(m) model_parameters(m, ci_method = "satterthwaite", effects = "fixed"))
+
+mc_mediation(med_main)
+```
+
+## Experiencer gender (Figure 4; Supplement Table S8)
+```{r}
+# Number of participants in each gender group
+Reapp_collapsed_clean_g %>% distinct(Subject, Gender) %>% count(Gender)
+
+m2_g <- lmer(PE ~ Phase * Trial * Gender + (1 + Phase + Trial | Subject),
+             data = Reapp_phase_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m2_g, ci_method = "satterthwaite")
+emmeans(m2_g, ~ Gender * Trial * Phase)
+
+# Social - Solo for each gender and phase
+emmeans(m2_g, ~ Trial | Gender * Phase) %>% pairs(reverse = TRUE) %>% summary(infer = TRUE)
+
+# Gender x origin on other outcomes
+m4_g <- lmer(Success ~ Trial * Gender + (1 + Trial | Subject),
+             data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m4_g, ci_method = "satterthwaite")
+
+m5_g1 <- lmer(Diff1 ~ Trial * Gender + (1 + Trial | Subject),
+              data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m5_g1, ci_method = "satterthwaite")
+
+m5_g2 <- lmer(Diff2 ~ Trial * Gender + (1 + Trial | Subject),
+              data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m5_g2, ci_method = "satterthwaite")
+
+m6_g <- lmer(Plau ~ Trial * Gender + (1 | Subject),
+             data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m6_g, ci_method = "satterthwaite")
+```
+
+```{r, fig.width = 9, fig.height = 4.5}
+# Figure 4
+ggplot(as.data.frame(emmeans(m2_g, ~ Gender * Trial * Phase)),
+       aes(x = Trial, y = emmean, fill = Phase)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE),
+                position = position_dodge(width = 0.7), width = 0.15) +
+  facet_wrap(~ Gender) +
+  labs(x = "Trial Type", y = "Positive Emotion", fill = "Phase") +
+  scale_y_continuous(breaks = 1:7) +
+  coord_cartesian(ylim = c(1, 7)) +
+  theme_classic(base_size = 14)
+```
+
+## Helper gender (Supplement Table S8)
+```{r}
+Reapp_collapsed_clean_g %>% distinct(Subject, h_Gender) %>% count(h_Gender)
+
+m2_g2 <- lmer(PE ~ Phase * Trial * h_Gender + (1 + Phase + Trial | Subject),
+              data = Reapp_phase_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m2_g2, ci_method = "satterthwaite")
+emmeans(m2_g2, ~ h_Gender * Trial * Phase)
+
+# Social - Solo for each helper gender and phase
+emmeans(m2_g2, ~ Trial | h_Gender * Phase) %>% pairs(reverse = TRUE) %>% summary(infer = TRUE)
+```
+
+## Relationship length and quality as moderators
+```{r}
+# Positive emotion
+m2_length <- lmer(PE ~ Phase * Trial * Length_mc + (1 + Phase + Trial | Subject),
+                  data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+print(model_parameters(m2_length, ci_method = "satterthwaite"), digits = 4, ci_digits = 4)
+
+m2_relationship <- lmer(PE ~ Phase * Trial * relationship_mc + (1 + Phase + Trial | Subject),
+                        data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+print(model_parameters(m2_relationship, ci_method = "satterthwaite"), digits = 4, ci_digits = 4)
+
+# Plausibility
+m6_length <- lmer(Plau ~ Trial * Length_mc + (1 + Trial | Subject),
+                  data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+print(model_parameters(m6_length, ci_method = "satterthwaite"), digits = 4, ci_digits = 4)
+
+m6_relationship <- lmer(Plau ~ Trial * relationship_mc + (1 + Trial | Subject),
+                        data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+print(model_parameters(m6_relationship, ci_method = "satterthwaite"), digits = 4, ci_digits = 4)
+```
+
+## Assumption checks
+```{r}
+models <- list(m1 = m1, m3 = m3, m2 = m2, m5 = m5, m6 = m6, m4 = m4)
+
+# Singular fits and convergence warnings (want all FALSE / NULL)
+sapply(models, isSingular)
+sapply(models, function(m) m@optinfo$conv$lme4$messages)
+
+# Residual normality, homoscedasticity, and random-effect normality
+for (m in models) print(check_model(m, check = c("qq", "homogeneity", "reqq")))
+```
+
+# SUPPLEMENT
+
+## Table S1: Demographics
+```{r}
+# Experiencer values are in the Participants chunk above; helper values below
+describe(Demo$h_Age)
+
+# Helper gender: 1 = Woman, 2 = Man, 3 = Non-binary/non-conforming
+table(Demo$h_Gender, useNA = "ifany")
+
+# Helper race/ethnicity (multiple selection allowed; same coding as experiencers)
+sapply(paste0("h_Race_", 1:8), function(v) {
+  n <- sum(Demo[[v]] == 1, na.rm = TRUE)
+  sprintf("%d (%.1f)", n, 100 * n / nrow(Demo))
+})
+```
+
+## Table S4: Descriptive statistics and correlations
+```{r}
+vars_trial  <- c("PE1", "PE2", "Diff1", "Diff2", "Plau", "Success")
+vars_person <- c("Length", "Hours")   # one value per person, so between-person only
+vars        <- c(vars_trial, vars_person)
+
+# Means and SDs: trial level for task variables, person level for Length and Hours
+describe(Reapp_collapsed_clean[vars_trial])
+describe(Demo[vars_person])
+
+# Between-person: correlations among person means
+r_between <- Reapp_collapsed_clean %>%
+  group_by(Subject) %>%
+  summarise(across(all_of(vars), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# Within-person: correlations among person-mean-centered trial scores
+r_within <- Reapp_collapsed_clean %>%
+  group_by(Subject) %>%
+  mutate(across(all_of(vars_trial), ~ .x - mean(.x, na.rm = TRUE))) %>%
+  ungroup()
+
+bt <- corr.test(r_between[vars],      use = "pairwise", adjust = "none")
+wt <- corr.test(r_within[vars_trial], use = "pairwise", adjust = "none")
+
+fmt_p <- function(p) ifelse(p < .001, "< .001", sub("^0", "", sprintf("%.3f", p)))
+get_w <- function(m, a, b) if (a %in% vars_trial && b %in% vars_trial) m[a, b] else NA
+
+corr_table <- do.call(rbind, lapply(combn(vars, 2, simplify = FALSE), function(x) {
+  wr <- get_w(wt$r, x[1], x[2]); wp <- get_w(wt$p, x[1], x[2])
+  data.frame(
+    Variable_1 = x[1],
+    Variable_2 = x[2],
+    Between_r  = round(bt$r[x[1], x[2]], 2),
+    Between_p  = fmt_p(bt$p[x[1], x[2]]),
+    Within_r   = round(wr, 2),
+    Within_p   = if (is.na(wp)) NA else fmt_p(wp)
+  )
+}))
+corr_table
+```
+
+## Table S5: Model fit statistics
+```{r}
+for (nm in names(models)) {
+  m <- models[[nm]]
+  cat("\n==========", nm, "==========\n")
+  print(model_parameters(m, ci_method = "satterthwaite", effects = "fixed"))
+  print(VarCorr(m))
+  print(r2_nakagawa(m))
+  cat("AIC =", round(AIC(m), 1), " BIC =", round(BIC(m), 1), " N =", nobs(m), "\n")
+}
+```
+
+## Table S6: Implementation tactics
+```{r}
+# 1 = focus on details, 2 = add details, 3 = imagine playing out, 4 = imagine future, 5 = other
+
+# Proportion of trials using each tactic
+Reapp_collapsed_clean %>%
+  group_by(Trial) %>%
+  summarise(across(all_of(tactics), ~ mean(. == 1, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(cols = all_of(tactics), names_to = "Tactic", values_to = "Proportion")
+
+# One vs. multiple tactics
+Reapp_collapsed_clean %>%
+  group_by(Trial) %>%
+  summarise(n_total   = sum(!is.na(n_tactics)),
+            n_1       = sum(n_tactics == 1, na.rm = TRUE),
+            n_2plus   = sum(n_tactics >= 2, na.rm = TRUE),
+            pct_1     = n_1 / n_total,
+            pct_2plus = n_2plus / n_total,
+            .groups = "drop")
+
+# Most common combinations among multi-tactic trials
+Reapp_collapsed_clean %>%
+  rowwise() %>%
+  mutate(combo = paste(tactics[which(c_across(all_of(tactics)) == 1)], collapse = " + ")) %>%
+  ungroup() %>%
+  filter(n_tactics >= 2) %>%
+  count(Trial, combo, sort = TRUE) %>%
+  group_by(Trial) %>%
+  mutate(pct_multi = n / sum(n),                                              # % of multi-tactic trials
+         pct_all   = n / sum(Reapp_collapsed_clean$Trial == unique(Trial))) %>% # % of all trials
+  ungroup()
+```
+
+## Exploratory: difficulty and plausibility
+```{r}
+# Phase 1 difficulty -> plausibility, and whether it differs by reappraisal origin
+m_plau <- lmer(Plau ~ Diff1_wp * Trial + Diff1_bp + (1 + Trial | Subject),
+               data = Reapp_collapsed_clean, REML = FALSE)
+model_parameters(m_plau, ci_method = "satterthwaite")
+```
+
+## Exploratory: plausibility and positive emotion
+```{r}
+# Phase 1 PE
+m_mod <- lmer(PE1 ~ Trial * Plau_wp + Plau_bp + (1 + Plau_wp | Subject),
+              data = Reapp_collapsed_clean, REML = FALSE)
+model_parameters(m_mod, ci_method = "satterthwaite")
+emtrends(m_mod, ~ Trial, var = "Plau_wp")
+
+# Phase 2 PE, controlling for Phase 1 PE
+m_mod2 <- lmer(PE2 ~ Trial * Plau_wp + Plau_bp + PE1_wp + PE1_bp + (1 + Plau_wp | Subject),
+               data = Reapp_collapsed_clean, REML = FALSE)
+model_parameters(m_mod2, ci_method = "satterthwaite")
+emtrends(m_mod2, ~ Trial, var = "Plau_wp")
+```
+
+# ROBUSTNESS CHECK: IMAGES AS A RANDOM FACTOR
+
+Models from the manuscript and supplement re-estimated with participants and images as crossed random factors (Judd et al., 2012).
+
+- By image: random intercepts and random slopes for Trial in every model.
+- By-image Phase slopes were dropped (near zero, singular or nonconvergent) except in the difficulty model.
+- Plausibility -> PE models: by-image random slopes for Plau_wp instead of Trial, mirroring the by-participant structure.
+- By-participant random effects are the same as above, except the gender model of plausibility, which adds by-participant Trial slopes to match the main plausibility model.
+
+```{r}
+# Satterthwaite df for emmeans/emtrends in the robustness models. This changes a global
+# emmeans setting, so the main-analysis chunks above should be run before this one.
+emm_options(lmer.df = "satterthwaite", lmerTest.limit = 6000)
+```
+
+## Main models
+```{r}
+m1_img <- lmer(PE2 ~ Trial + (1 + Trial | Subject) + (1 + Trial | Image),
+               data = Neg_collapsed, REML = FALSE, na.action = na.exclude)
+emm1_img <- emmeans(m1_img, ~ Trial)
+emm1_img
+summary(contrast(emm1_img, "trt.vs.ctrl", adjust = "none"), infer = TRUE)
+
+m2_img <- lmer(PE ~ Phase * Trial + (1 + Phase + Trial | Subject) + (1 + Trial | Image),
+               data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+emm2_img <- emmeans(m2_img, ~ Phase * Trial)
+emm2_img
+summary(pairs(emm2_img, reverse = TRUE), infer = TRUE)
+contrast(emm2_img, interaction = c("revpairwise", "pairwise")) %>% summary(infer = TRUE)
+
+m3_img <- lmer(PE ~ Phase * Trial + (1 + Phase + Trial | Subject) + (1 + Trial | Image),
+               data = Reapp_phase, REML = FALSE, na.action = na.exclude)
+emm3_img <- emmeans(m3_img, ~ Phase * Trial)
+emm3_img
+summary(pairs(emm3_img, reverse = TRUE), infer = TRUE)
+
+m5_img <- lmer(Diff ~ Phase * Trial + (1 + Phase + Trial | Subject) + (1 + Phase + Trial | Image),
+               data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+emm5_img <- emmeans(m5_img, ~ Phase * Trial)
+emm5_img
+summary(pairs(emm5_img, reverse = TRUE), infer = TRUE)
+
+m6_img <- lmer(Plau ~ Trial + (1 + Trial | Subject) + (1 + Trial | Image),
+               data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+emm6_img <- emmeans(m6_img, ~ Trial)
+emm6_img
+summary(pairs(emm6_img, reverse = TRUE), infer = TRUE)
+
+m4_img <- lmer(Success ~ Trial + (1 + Trial | Subject) + (1 + Trial | Image),
+               data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+emm4_img <- emmeans(m4_img, ~ Trial)
+emm4_img
+summary(pairs(emm4_img, reverse = TRUE), infer = TRUE)
+```
+
+## Difficulty, plausibility, and positive emotion
+```{r}
+m_plau_img <- lmer(Plau ~ Diff1_wp * Trial + Diff1_bp + (1 + Trial | Subject) + (1 + Trial | Image),
+                   data = Reapp_collapsed_clean, REML = FALSE)
+model_parameters(m_plau_img, ci_method = "satterthwaite")
+
+m_mod_img <- lmer(PE1 ~ Trial * Plau_wp + Plau_bp + (1 + Plau_wp | Subject) + (1 + Plau_wp | Image),
+                  data = Reapp_collapsed_clean, REML = FALSE)
+model_parameters(m_mod_img, ci_method = "satterthwaite")
+emtrends(m_mod_img, ~ Trial, var = "Plau_wp")
+
+m_mod2_img <- lmer(PE2 ~ Trial * Plau_wp + Plau_bp + PE1_wp + PE1_bp +
+                     (1 + Plau_wp | Subject) + (1 + Plau_wp | Image),
+                   data = Reapp_collapsed_clean, REML = FALSE)
+model_parameters(m_mod2_img, ci_method = "satterthwaite")
+emtrends(m_mod2_img, ~ Trial, var = "Plau_wp")
+```
+
+## Mediation
+```{r}
+med_img <- fit_paths("(1 + Trial | Subject) + (1 + Trial | Image)")
+sapply(med_img, isSingular)
+lapply(med_img, function(m) model_parameters(m, ci_method = "satterthwaite", effects = "fixed"))
+mc_mediation(med_img)
+```
+
+## Experiencer and helper gender
+```{r}
+m2_g_img <- lmer(PE ~ Phase * Trial * Gender + (1 + Phase + Trial | Subject) + (1 + Trial | Image),
+                 data = Reapp_phase_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m2_g_img, ci_method = "satterthwaite")
+emmeans(m2_g_img, ~ Trial | Gender * Phase) %>% pairs(reverse = TRUE) %>% summary(infer = TRUE)
+
+m4_g_img <- lmer(Success ~ Trial * Gender + (1 + Trial | Subject) + (1 + Trial | Image),
+                 data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m4_g_img, ci_method = "satterthwaite")
+
+m5_g1_img <- lmer(Diff1 ~ Trial * Gender + (1 + Trial | Subject) + (1 + Trial | Image),
+                  data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m5_g1_img, ci_method = "satterthwaite")
+
+m5_g2_img <- lmer(Diff2 ~ Trial * Gender + (1 + Trial | Subject) + (1 + Trial | Image),
+                  data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m5_g2_img, ci_method = "satterthwaite")
+
+m6_g_img <- lmer(Plau ~ Trial * Gender + (1 + Trial | Subject) + (1 + Trial | Image),
+                 data = Reapp_collapsed_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m6_g_img, ci_method = "satterthwaite")
+
+m2_g2_img <- lmer(PE ~ Phase * Trial * h_Gender + (1 + Phase + Trial | Subject) + (1 + Trial | Image),
+                  data = Reapp_phase_clean_g, REML = FALSE, na.action = na.exclude)
+model_parameters(m2_g2_img, ci_method = "satterthwaite")
+emmeans(m2_g2_img, ~ Trial | h_Gender * Phase) %>% pairs(reverse = TRUE) %>% summary(infer = TRUE)
+```
+
+## Relationship length and quality
+```{r}
+m2_length_img <- lmer(PE ~ Phase * Trial * Length_mc + (1 + Phase + Trial | Subject) + (1 + Trial | Image),
+                      data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+model_parameters(m2_length_img, ci_method = "satterthwaite")
+
+m2_relationship_img <- lmer(PE ~ Phase * Trial * relationship_mc + (1 + Phase + Trial | Subject) + (1 + Trial | Image),
+                            data = Reapp_phase_clean, REML = FALSE, na.action = na.exclude)
+model_parameters(m2_relationship_img, ci_method = "satterthwaite")
+
+m6_length_img <- lmer(Plau ~ Trial * Length_mc + (1 + Trial | Subject) + (1 + Trial | Image),
+                      data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+model_parameters(m6_length_img, ci_method = "satterthwaite")
+
+m6_relationship_img <- lmer(Plau ~ Trial * relationship_mc + (1 + Trial | Subject) + (1 + Trial | Image),
+                            data = Reapp_collapsed_clean, REML = FALSE, na.action = na.exclude)
+model_parameters(m6_relationship_img, ci_method = "satterthwaite")
+```
+
+## Singular fits and convergence warnings for the robustness models
+```{r}
+img_models <- Filter(function(x) inherits(x, "merMod"),
+                     mget(grep("_img$", ls(), value = TRUE)))
+img_models <- c(img_models, setNames(med_img, paste0("med_img$", names(med_img))))
+
+data.frame(
+  model    = names(img_models),
+  singular = sapply(img_models, isSingular),
+  converge_warning = sapply(img_models, function(m) {
+    msg <- m@optinfo$conv$lme4$messages
+    if (is.null(msg)) "" else paste(msg, collapse = "; ")
+  }),
+  row.names = NULL
+)
+```
